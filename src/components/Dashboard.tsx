@@ -12,9 +12,7 @@ import {
   LayoutGrid,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { action, desktop, openApp, openPanel } from "../api";
+import { action, desktop, nativeAction, openApp, openPanel } from "../api";
 import {
   degrees,
   gb,
@@ -27,6 +25,7 @@ import {
 import { features, defaultApps } from "../features";
 import { usePreferences } from "../preferences";
 import type { Snapshot, Detail } from "../types";
+import { useActions } from "../useActions";
 import { Chart } from "./Chart";
 
 function Legend({
@@ -60,47 +59,39 @@ export function Dashboard({
 }) {
   const [preferences] = usePreferences();
   const [notice, setNotice] = useState("");
-  const [awake, setAwake] = useState(false);
-  const [clean, setClean] = useState(false);
-  useEffect(() => {
-    if (desktop)
-      invoke<boolean>("awake_status")
-        .then(setAwake)
-        .catch((e) => setNotice(String(e)));
-  }, []);
+  const { status, statusError, refresh } = useActions();
+  const [busy, setBusy] = useState<string | null>(null);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 6000);
     return () => clearTimeout(timer);
   }, [notice]);
   useEffect(() => {
-    if (!clean) return;
-    const close = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setClean(false);
-        if (desktop)
-          getCurrentWindow()
-            .setFullscreen(false)
-            .catch((err) => setNotice(String(err)));
-      }
-    };
-    window.addEventListener("keydown", close);
-    return () => window.removeEventListener("keydown", close);
-  }, [clean]);
+    if (!desktop) return;
+    nativeAction("configure-hotkeys", { hotkeys: preferences.hotkeys }).catch(
+      (e) => setNotice(String(e)),
+    );
+    if (preferences.shortcuts === "double")
+      nativeAction("shortcuts-enable").catch((e) => setNotice(String(e)));
+    else nativeAction("shortcuts-off").catch((e) => setNotice(String(e)));
+  }, [preferences.hotkeys, preferences.shortcuts]);
   const openDetail = (detail: Detail) => {
     openPanel("details", detail).catch((e) => setNotice(String(e)));
   };
   const run = async (id: string) => {
+    setBusy(id);
     try {
-      if (id === "clean-screen") {
-        if (desktop) await getCurrentWindow().setFullscreen(true);
-        setClean(true);
-        return;
-      }
       const result = await action(id);
-      if (id === "awake") setAwake(result === "on");
+      await refresh();
+      if (id === "purge")
+        setNotice("系统缓存已清理；macOS 会根据需要重新缓存。");
+      else if (id === "trash" && result !== "cancelled")
+        setNotice("废纸篓已清倒");
+      else if (id === "displays") setNotice("已切换为扩展显示模式");
     } catch (e) {
       setNotice(String(e));
+    } finally {
+      setBusy(null);
     }
   };
   return (
@@ -110,20 +101,6 @@ export function Dashboard({
         data-tauri-drag-region
         aria-label="拖动窗口"
       />
-      {clean && (
-        <div
-          className="clean-screen"
-          onDoubleClick={() => {
-            setClean(false);
-            if (desktop)
-              getCurrentWindow()
-                .setFullscreen(false)
-                .catch((e) => setNotice(String(e)));
-          }}
-        >
-          <span>按 Esc 或双击退出</span>
-        </div>
-      )}
       <div className="dashboard-body">
         {data ? (
           <div className="metrics-grid">
@@ -311,8 +288,12 @@ export function Dashboard({
                 />
               </div>
               <div className="storage-footer memory-footer">
-                <button className="link" onClick={() => openDetail("memory")}>
-                  详细
+                <button
+                  className="link"
+                  disabled={busy !== null}
+                  onClick={() => void run("purge")}
+                >
+                  释放
                 </button>
               </div>
             </section>
@@ -333,7 +314,7 @@ export function Dashboard({
                     openPanel("fans").catch((e) => setNotice(String(e)))
                   }
                 >
-                  详情
+                  调节
                 </button>
               </header>
               <div className="fan-values">
@@ -428,17 +409,21 @@ export function Dashboard({
             .filter((feature) => preferences.enabled.includes(feature.id))
             .map((feature) => (
               <button
-                className={`quick-feature ${feature.id === "awake" && awake ? "is-active" : ""}`}
+                className={`quick-feature ${feature.toggle && status[feature.id] === true ? "is-active" : ""}`}
                 key={feature.id}
-                disabled={!!feature.unsupported}
-                title={feature.unsupported ?? feature.description}
+                disabled={busy !== null}
+                title={feature.description}
                 onClick={() => void run(feature.id)}
-                aria-pressed={feature.id === "awake" ? awake : undefined}
+                aria-pressed={
+                  feature.toggle ? status[feature.id] === true : undefined
+                }
               >
                 <span className="feature-circle">
                   <feature.icon />
                 </span>
-                <span className="feature-name">{feature.label}</span>
+                <span className="feature-name">
+                  {busy === feature.id ? "执行中…" : feature.label}
+                </span>
               </button>
             ))}
           <button
@@ -466,9 +451,9 @@ export function Dashboard({
           <MoreHorizontal />
         </button>
       </footer>
-      {(notice || (error && data)) && (
+      {(notice || statusError || (error && data)) && (
         <div className="toast" role="status">
-          {notice || error}
+          {notice || statusError || error}
         </div>
       )}
     </main>

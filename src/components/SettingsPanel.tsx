@@ -1,14 +1,39 @@
 import { useState } from "react";
 import { Plus, Minus, AppWindow } from "lucide-react";
+import { useActions } from "../useActions";
 import { features, defaultApps } from "../features";
 import { usePreferences } from "../preferences";
-import { action, openApp } from "../api";
+import { action, openApp, nativeAction, desktop } from "../api";
 
 export function SettingsPanel() {
   const [tab, setTab] = useState<"features" | "apps">("features");
   const [preferences, save] = usePreferences();
   const [selection, setSelection] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const { status, statusError, refresh } = useActions();
+  const [busy, setBusy] = useState<string | null>(null);
+  const run = async (id: string) => {
+    setBusy(id);
+    try {
+      await action(id);
+      await refresh();
+      setError("");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+  const configure = async (hotkeys: Record<string, number>) => {
+    try {
+      await nativeAction("configure-hotkeys", { hotkeys });
+      save({ ...preferences, hotkeys });
+      setError("");
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const toggle = (id: string) =>
     save({
       ...preferences,
@@ -19,6 +44,7 @@ export function SettingsPanel() {
   const add = async () => {
     try {
       const path = (await action("pick-app")).replace(/\/$/, "");
+      if (!path) return;
       if (preferences.customApps.some((app) => app.path === path)) return;
       save({
         ...preferences,
@@ -97,24 +123,62 @@ export function SettingsPanel() {
                     </td>
                     <td>{feature.label}</td>
                     <td>
-                      <span
-                        className={`action-tag ${feature.unsupported ? "unavailable" : ""}`}
-                      >
-                        {feature.unsupported
-                          ? "暂不可用"
-                          : [
-                                "keep-display",
-                                "menubar",
-                                "displays",
-                                "lowpower",
-                              ].includes(feature.id)
-                            ? "系统设置"
-                            : "直接执行"}
-                      </span>
+                      {["awake", "keep-display", "lock-dock"].includes(
+                        feature.id,
+                      ) ? (
+                        <select
+                          aria-label={`${feature.label}快捷键`}
+                          value={preferences.hotkeys[feature.id] ?? ""}
+                          onChange={(e) => {
+                            const hotkeys = { ...preferences.hotkeys };
+                            if (e.target.value === "")
+                              delete hotkeys[feature.id];
+                            else hotkeys[feature.id] = Number(e.target.value);
+                            void configure(hotkeys);
+                          }}
+                        >
+                          <option value="">无快捷键</option>
+                          <option value={0}>⌃⌥⌘ A</option>
+                          <option value={2}>⌃⌥⌘ D</option>
+                          <option value={37}>⌃⌥⌘ L</option>
+                        </select>
+                      ) : feature.id === "shortcuts" ? (
+                        <select
+                          aria-label="键指如飞触发方式"
+                          value={preferences.shortcuts}
+                          onChange={(e) => {
+                            const mode = e.target.value as "off" | "double";
+                            nativeAction(
+                              mode === "off"
+                                ? "shortcuts-off"
+                                : "shortcuts-enable",
+                            )
+                              .then(() =>
+                                save({ ...preferences, shortcuts: mode }),
+                              )
+                              .catch((e) => setError(String(e)));
+                          }}
+                        >
+                          <option value="off">点击图标</option>
+                          <option value="double">双按并按住 ⌘</option>
+                        </select>
+                      ) : (
+                        <button
+                          className="native-button"
+                          disabled={busy !== null}
+                          onClick={() => void run(feature.id)}
+                        >
+                          {busy === feature.id
+                            ? "执行中…"
+                            : feature.toggle
+                              ? status[feature.id] === true
+                                ? "已开启 · 关闭"
+                                : "已关闭 · 开启"
+                              : "执行"}
+                        </button>
+                      )}
                     </td>
-                    <td title={feature.unsupported ?? feature.description}>
-                      {feature.unsupported ?? feature.description}
-                    </td>
+                    <td title={feature.description}>{feature.description}</td>
                   </tr>
                 ))}
               </tbody>
@@ -160,7 +224,24 @@ export function SettingsPanel() {
       <footer className="settings-footer">
         {tab === "features" ? (
           <>
-            <span className="muted">显示设置自动保存</span>
+            <span className="muted">
+              显示设置自动保存 ·{" "}
+              {desktop
+                ? status.accessibility
+                  ? "辅助功能已授权"
+                  : "辅助功能未授权"
+                : "浏览器预览"}
+            </span>
+            <button
+              className="native-button"
+              onClick={() =>
+                nativeAction("permission")
+                  .then(refresh)
+                  .catch((e) => setError(String(e)))
+              }
+            >
+              授权辅助功能
+            </button>
             <button
               className="native-button"
               onClick={() =>
@@ -204,9 +285,9 @@ export function SettingsPanel() {
           </>
         )}
       </footer>
-      {error && (
+      {(error || statusError) && (
         <div className="panel-error" role="alert">
-          {error}
+          {error || statusError}
           <button onClick={() => setError("")}>关闭</button>
         </div>
       )}

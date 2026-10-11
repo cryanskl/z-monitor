@@ -3,14 +3,21 @@ import { features } from "./features";
 
 export interface Preferences {
   enabled: string[];
+  hotkeys: Record<string, number>;
+  shortcuts: "off" | "double";
   customApps: { path: string; label: string }[];
 }
 const key = "z-monitor.preferences.v1";
 function read(): Preferences {
   const saved = localStorage.getItem(key);
   return saved
-    ? JSON.parse(saved)
-    : { enabled: features.map((feature) => feature.id), customApps: [] };
+    ? { hotkeys: {}, shortcuts: "off", ...JSON.parse(saved) }
+    : {
+        enabled: features.map((feature) => feature.id),
+        customApps: [],
+        hotkeys: {},
+        shortcuts: "off",
+      };
 }
 export function usePreferences() {
   const [preferences, setPreferences] = useState(read);

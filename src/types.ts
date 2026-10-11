@@ -9,6 +9,7 @@ export interface Fan {
   min: number | null;
   max: number | null;
   mode: number | null;
+  target: number | null;
 }
 export interface Snapshot {
   timestamp: number;

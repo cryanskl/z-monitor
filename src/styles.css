@@ -955,3 +955,66 @@ select {
     gap: 12px 2px;
   }
 }
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: #0005;
+  display: grid;
+  place-items: center;
+  z-index: 100;
+}
+.fan-dialog {
+  width: 440px;
+  max-height: 94vh;
+  overflow: auto;
+  border: 1px solid #aaa;
+  border-radius: 12px;
+  padding: 20px;
+  background: #eee;
+  box-shadow: 0 16px 48px #0003;
+  font-size: 13px;
+}
+.fan-dialog h3 {
+  margin: 0 0 12px;
+  font-size: 16px;
+}
+.fan-dialog p {
+  line-height: 1.5;
+  margin: 10px 0;
+}
+.fan-dialog label {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 12px 0;
+}
+.fan-dialog input[type="number"] {
+  width: 120px;
+  font: inherit;
+  padding: 5px;
+}
+.fan-dialog input[type="range"] {
+  width: 100%;
+  accent-color: #0087ff;
+}
+.dialog-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+.primary {
+  background: #0087ff;
+  color: white;
+}
+.features-table select {
+  max-width: 128px;
+  font: inherit;
+}
+.fan-table td:last-child {
+  white-space: nowrap;
+}
+.fan-table .fan-mode {
+  font-size: 10px;
+  margin: 0 3px;
+}

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Fan, Microchip, HelpCircle } from "lucide-react";
-import { desktop, openPanel } from "../api";
+import { desktop, openPanel, setFan } from "../api";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { groupLabel } from "../format";
 import type { Snapshot } from "../types";
@@ -15,6 +15,27 @@ export function FansPanel({
   const [group, setGroup] = useState("all");
   const [help, setHelp] = useState(false);
   const [notice, setNotice] = useState("");
+  const [editing, setEditing] = useState<number | null>(null);
+  const [target, setTarget] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const selected = data?.fans.find((fan) => fan.id === editing);
+  const apply = async (id: number, rpm: number | null) => {
+    setBusy(true);
+    setNotice("");
+    try {
+      const result = await setFan(id, rpm);
+      setNotice(
+        rpm === null
+          ? "已读回自动模式；当前 RPM 会逐步变化。"
+          : `控制器已确认目标 ${Math.round(result.target!)} RPM；实际转速会逐步接近目标。`,
+      );
+      setEditing(null);
+    } catch (error) {
+      setNotice(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
   const sensors =
     data?.sensors.filter(
       (sensor) => group === "all" || sensor.group === group,
@@ -28,7 +49,10 @@ export function FansPanel({
       </header>
       <div className="fan-toolbar">
         <label>
-          运行模式：<span className="native-button">只读监控</span>
+          运行模式：
+          <span className="native-button">
+            {data?.fans.some((fan) => fan.mode === 1) ? "手动" : "自动"}
+          </span>
         </label>
         <label>
           温度传感器：
@@ -77,6 +101,14 @@ export function FansPanel({
                     <span>{rpm(fan.max)}</span>
                   </td>
                   <td>
+                    <button
+                      className="native-button"
+                      disabled={busy}
+                      onClick={() => void apply(fan.id, null)}
+                      title="恢复系统自动调节"
+                    >
+                      自动
+                    </button>
                     <span className="fan-mode">
                       {fan.mode === 0 || fan.mode === 3
                         ? "自动"
@@ -86,8 +118,27 @@ export function FansPanel({
                     </span>
                     <button
                       className="native-button"
-                      disabled
-                      title="此版本只读，暂不写入风扇控制器"
+                      disabled={busy || fan.min === null || fan.max === null}
+                      title={
+                        fan.target === null
+                          ? "设置固定转速"
+                          : `控制器目标：${Math.round(fan.target)} RPM`
+                      }
+                      onClick={() => {
+                        setTarget(
+                          Math.round(
+                            Math.max(
+                              fan.min!,
+                              Math.min(
+                                fan.max!,
+                                fan.target || fan.current || fan.min!,
+                              ),
+                            ),
+                          ),
+                        );
+                        setEditing(fan.id);
+                        setNotice("");
+                      }}
                     >
                       固定转速…
                     </button>
@@ -167,6 +218,72 @@ export function FansPanel({
           </button>
         </div>
       </footer>
+      {selected && (
+        <div className="dialog-backdrop">
+          <form
+            className="fan-dialog"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void apply(selected.id, target);
+            }}
+          >
+            <h3>风扇 {selected.id + 1} · 固定转速</h3>
+            <p>
+              设置范围 {Math.ceil(selected.min!)}–{Math.floor(selected.max!)}{" "}
+              RPM。首次调节需要管理员授权；设置后会读回控制器确认。
+            </p>
+            <label>
+              目标 RPM{" "}
+              <input
+                aria-label="目标 RPM"
+                type="number"
+                min={Math.ceil(selected.min!)}
+                max={Math.floor(selected.max!)}
+                step={1}
+                value={target}
+                onChange={(e) => setTarget(Number(e.target.value))}
+                required
+                disabled={busy}
+              />
+            </label>
+            <input
+              aria-label="风扇转速滑块"
+              type="range"
+              min={Math.ceil(selected.min!)}
+              max={Math.floor(selected.max!)}
+              step={1}
+              value={target}
+              onChange={(e) => setTarget(Number(e.target.value))}
+              disabled={busy}
+            />
+            <p className="muted">
+              应用退出或控制连接断开时恢复自动。请先停止其他风扇控制软件，避免相互覆盖。
+            </p>
+            {notice && (
+              <p role="alert" className="hot">
+                {notice}
+              </p>
+            )}
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="native-button"
+                disabled={busy}
+                onClick={() => setEditing(null)}
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                className="native-button primary"
+                disabled={busy}
+              >
+                {busy ? "等待授权 / 写入确认…" : "应用固定转速"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
       {(help || notice || (data?.issues.length ?? 0) > 0) && (
         <aside className="fan-help">
           {notice || (
@@ -174,7 +291,7 @@ export function FansPanel({
               <strong>来自本机 SMC 的实时读数</strong>
               <p>
                 保留传感器原始键名；CPU/GPU
-                卡片显示各组温度平均值。风扇模式和转速只读，控制仍由当前系统/控制软件负责。未提供的数据以
+                卡片显示各组温度平均值。“自动”交还系统控制，“固定转速”写入硬件允许范围内的目标并确认读回。实际转速需要几秒变化，控制会话断开会恢复自动。未提供的数据以
                 — 显示。
               </p>
               {data?.issues.map((issue) => (

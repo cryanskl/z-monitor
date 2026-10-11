@@ -7,3 +7,7 @@ src-tauri/binaries/monitor
 *.tsbuildinfo
 src-tauri/gen/
 .local/
+src-tauri/binaries/libactions.dylib
+src-tauri/binaries/fan-control
+src-tauri/binaries/libzmonitor_native.a
+src-tauri/binaries/power-control

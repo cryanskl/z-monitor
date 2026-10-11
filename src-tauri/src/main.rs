@@ -2,9 +2,16 @@
 
 use serde_json::Value;
 use std::{
-    io::{BufRead, BufReader},
+    ffi::{CStr, CString},
+    io::{BufRead, BufReader, Write},
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -12,10 +19,186 @@ use tauri::{
     Manager,
 };
 
+extern "C" {
+    fn z_action(json: *const libc::c_char) -> *mut libc::c_char;
+    fn z_free(string: *mut libc::c_char);
+}
+
 struct Monitor {
     snapshot: Arc<Mutex<Result<Value, String>>>,
     process: Mutex<Child>,
-    awake: Mutex<Option<Child>>,
+    fan_helper: PathBuf,
+    fan_session: Mutex<Option<FanSession>>,
+}
+
+struct FanSession {
+    stream: BufReader<UnixStream>,
+    directory: PathBuf,
+}
+impl Drop for FanSession {
+    fn drop(&mut self) {
+        if let Err(e) = self.stream.get_ref().shutdown(std::net::Shutdown::Both) {
+            eprintln!("Fan shutdown: {e}");
+        }
+        if let Err(e) = std::fs::remove_file(self.directory.join("control.sock")) {
+            eprintln!("Fan socket cleanup: {e}");
+        }
+        if let Err(e) = std::fs::remove_dir(&self.directory) {
+            eprintln!("Fan directory cleanup: {e}");
+        }
+    }
+}
+impl Monitor {
+    fn native_action(&self, request: Value) -> Result<Value, String> {
+        let input = CString::new(request.to_string()).map_err(|e| e.to_string())?;
+        unsafe {
+            let ptr = z_action(input.as_ptr());
+            let response = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            z_free(ptr);
+            let data: Value = serde_json::from_str(&response).map_err(|e| e.to_string())?;
+            if data["ok"] == true {
+                Ok(data["value"].clone())
+            } else {
+                Err(data["error"].as_str().unwrap().into())
+            }
+        }
+    }
+    fn start_fan_session(&self) -> Result<FanSession, String> {
+        let directory = PathBuf::from("/tmp").join(format!(
+            "zm-fan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        let socket = directory.join("control.sock");
+        let listener = UnixListener::bind(&socket).map_err(|e| e.to_string())?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let shell_quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+        let command = format!(
+            "{} --session {} {} {}",
+            shell_quote(self.fan_helper.to_str().unwrap()),
+            std::process::id(),
+            unsafe { libc::getuid() },
+            shell_quote(socket.to_str().unwrap())
+        );
+        let script = format!(
+            "do shell script {} with administrator privileges",
+            serde_json::to_string(&command).unwrap()
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run("/usr/bin/osascript", &["-e", &script]);
+            if let Err(ref error) = result {
+                eprintln!("Fan administrator session: {error}");
+            }
+            let _ = sender.send(result);
+        });
+        let start = Instant::now();
+        let accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Ok(stream),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => break Err(e.to_string()),
+            }
+            if let Ok(result) = receiver.try_recv() {
+                break Err(result.err().unwrap_or_else(|| "风扇会话提前退出".into()));
+            }
+            if start.elapsed() > Duration::from_secs(120) {
+                break Err("管理员授权等待超时，请重新点击设置转速".into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        drop(listener);
+        match accepted {
+            Ok(stream) => {
+                let mut uid = 0;
+                let mut gid = 0;
+                use std::os::fd::AsRawFd;
+                if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0
+                    || uid != 0
+                {
+                    return Err("风扇 helper 未以管理员身份连接".into());
+                }
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(45)))
+                    .map_err(|e| e.to_string())?;
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|e| e.to_string())?;
+                let mut session = FanSession {
+                    stream: BufReader::new(stream),
+                    directory,
+                };
+                read_fan_response(&mut session)?;
+                Ok(session)
+            }
+            Err(error) => {
+                std::fs::remove_file(&socket).map_err(|e| e.to_string())?;
+                std::fs::remove_dir(&directory).map_err(|e| e.to_string())?;
+                Err(format!("管理员授权未完成：{error}"))
+            }
+        }
+    }
+}
+fn read_fan_response(session: &mut FanSession) -> Result<Value, String> {
+    let mut response = String::new();
+    let length = session
+        .stream
+        .read_line(&mut response)
+        .map_err(|e| e.to_string())?;
+    if length == 0 {
+        return Err("风扇控制会话已断开，请重新授权".into());
+    }
+    let value: Value = serde_json::from_str(&response).map_err(|e| e.to_string())?;
+    if value["ok"] == true {
+        Ok(value["value"].clone())
+    } else {
+        Err(value["error"].as_str().unwrap().into())
+    }
+}
+#[tauri::command]
+async fn native_action(
+    request: Value,
+    monitor: tauri::State<'_, Monitor>,
+) -> Result<Value, String> {
+    monitor.native_action(request)
+}
+#[tauri::command]
+async fn action_status(monitor: tauri::State<'_, Monitor>) -> Result<Value, String> {
+    let mut status = monitor.native_action(serde_json::json!({"action": "status"}))?;
+    let power = run("/usr/bin/pmset", &["-g", "custom"])?;
+    status["lowpower"] = Value::Bool(power.lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields == ["powermode", "1"] || fields == ["lowpowermode", "1"]
+    }));
+    Ok(status)
+}
+#[tauri::command]
+async fn set_fan(
+    id: u32,
+    rpm: Option<f64>,
+    monitor: tauri::State<'_, Monitor>,
+) -> Result<Value, String> {
+    let mut state = monitor.fan_session.lock().unwrap();
+    if state.is_none() {
+        *state = Some(monitor.start_fan_session()?);
+    }
+    let session = state.as_mut().unwrap();
+    let request = serde_json::json!({"id": id, "rpm": rpm}).to_string() + "\n";
+    if let Err(e) = session.stream.get_mut().write_all(request.as_bytes()) {
+        state.take();
+        return Err(e.to_string());
+    }
+    let result = read_fan_response(session);
+    if result.is_err() {
+        state.take();
+    }
+    result
 }
 
 #[tauri::command]
@@ -29,7 +212,12 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if message.is_empty() {
+            format!("{program} 未完成：{}", output.status)
+        } else {
+            message
+        });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -40,42 +228,31 @@ async fn quick_action(
     monitor: tauri::State<'_, Monitor>,
 ) -> Result<String, String> {
     match action.as_str() {
-        "awake" => {
-            let mut awake = monitor.awake.lock().unwrap();
-            if let Some(mut child) = awake.take() {
-                child.kill().map_err(|e| e.to_string())?;
-                child.wait().map_err(|e| e.to_string())?;
-                Ok("off".into())
-            } else {
-                *awake = Some(Command::new("/usr/bin/caffeinate").args(["-i", "-s"]).spawn().map_err(|e| e.to_string())?);
-                Ok("on".into())
-            }
-        },
-        "keep-display" => run("/usr/bin/osascript", &["-e", "tell application \"System Settings\" to activate", "-e", "open location \"x-apple.systempreferences:com.apple.Lock-Screen-Settings.extension\""]),
+        "lock" | "awake" | "keep-display" | "desktop" | "dock" | "menubar" | "displays" | "notch" | "lock-dock" | "shortcuts" | "clean-screen" | "clean-keyboard" => Ok(monitor.native_action(serde_json::json!({"action": action}))?.to_string()),
         "dark" => run("/usr/bin/osascript", &["-e", "tell application \"System Events\" to tell appearance preferences to set dark mode to not dark mode"]),
-        "lock" => run("/usr/bin/osascript", &["-e", "tell application \"System Events\" to keystroke \"q\" using {command down, control down}"]),
         "screensaver" => run("/usr/bin/open", &["-a", "/System/Library/CoreServices/ScreenSaverEngine.app"]),
-        "desktop" => {
-            let value = run("/usr/bin/osascript", &["-e", "tell application \"System Events\" to tell preferences file \"com.apple.finder\"\nif exists property list item \"CreateDesktop\" then\nreturn value of property list item \"CreateDesktop\"\nelse\nreturn true\nend if\nend tell"])?;
-            let next = if value == "false" { "true" } else { "false" };
-            run("/usr/bin/defaults", &["write", "com.apple.finder", "CreateDesktop", "-bool", next])?;
-            run("/usr/bin/killall", &["Finder"])
+        "trash" => {
+            if monitor.native_action(serde_json::json!({"action": "confirm-trash"}))? != true { return Ok("cancelled".into()); }
+            run("/usr/bin/osascript", &["-e", "tell application \"Finder\" to empty trash"])
         },
-        "dock" => {
-            let current = run("/usr/bin/defaults", &["read", "com.apple.dock", "autohide"])?;
-            let next = if current == "1" { "false" } else { "true" };
-            run("/usr/bin/defaults", &["write", "com.apple.dock", "autohide", "-bool", next])?;
-            run("/usr/bin/killall", &["Dock"])
+        "lowpower" => {
+            let current = run("/usr/bin/pmset", &["-g", "custom"])?;
+            let on = current.lines().any(|line| { let parts: Vec<_> = line.split_whitespace().collect(); parts == ["powermode", "1"] || parts == ["lowpowermode", "1"] });
+            let command = format!("/usr/bin/pmset -a lowpowermode {}", if on {0} else {1});
+            let script = format!("do shell script {} with administrator privileges", serde_json::to_string(&command).unwrap());
+            run("/usr/bin/osascript", &["-e", &script])?;
+            let readback = run("/usr/bin/pmset", &["-g", "custom"])?;
+            let modes: Vec<_> = readback.lines().filter_map(|line| { let parts: Vec<_> = line.split_whitespace().collect(); if parts.len() == 2 && ["powermode", "lowpowermode"].contains(&parts[0]) {Some(parts[1])} else {None} }).collect();
+            if modes.is_empty() || !modes.iter().all(|value| *value == if on {"0"} else {"1"}) { return Err("省电模式设置未生效，请检查这台 Mac 是否支持低电量模式".into()); }
+            Ok(if on {"off"} else {"on"}.into())
         },
-        "menubar" => run("/usr/bin/open", &["x-apple.systempreferences:com.apple.ControlCenter-Settings.extension"]),
-        "displays" => run("/usr/bin/open", &["x-apple.systempreferences:com.apple.Displays-Settings.extension"]),
-        "lowpower" => run("/usr/bin/open", &["x-apple.systempreferences:com.apple.Battery-Settings.extension"]),
+        "purge" => run("/usr/bin/osascript", &["-e", "do shell script \"/usr/bin/purge\" with administrator privileges"]),
         "system-settings" => run("/usr/bin/open", &["-a", "System Settings"]),
         "disk-utility" => run("/usr/bin/open", &["-a", "Disk Utility"]),
         "system-information" => run("/usr/bin/open", &["-a", "System Information"]),
         "privacy" => run("/usr/bin/open", &["x-apple.systempreferences:com.apple.preference.security"]),
         "activity-monitor" => run("/usr/bin/open", &["-a", "Activity Monitor"]),
-        "pick-app" => run("/usr/bin/osascript", &["-e", "POSIX path of (choose file with prompt \"选择快捷应用\" of type {\"com.apple.application-bundle\"})"]),
+        "pick-app" => Ok(monitor.native_action(serde_json::json!({"action": "pick-app"}))?.as_str().unwrap().into()),
         _ => Err(format!("Unsupported action: {action}")),
     }
 }
@@ -92,11 +269,6 @@ fn open_application(path: &str) -> Result<String, String> {
     run("/usr/bin/open", &["-a", path])
 }
 
-#[tauri::command]
-fn awake_status(monitor: tauri::State<Monitor>) -> bool {
-    monitor.awake.lock().unwrap().is_some()
-}
-
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -105,7 +277,10 @@ fn main() {
             } else {
                 app.path().resource_dir()?.join("binaries/monitor")
             };
-            let mut child = Command::new(path)
+            let binaries = path.parent().unwrap();
+            std::env::set_var("Z_MONITOR_NATIVE_DIR", binaries);
+            let fan_helper = binaries.join("fan-control");
+            let mut child = Command::new(&path)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()?;
@@ -125,8 +300,12 @@ fn main() {
             app.manage(Monitor {
                 snapshot,
                 process: Mutex::new(child),
-                awake: Mutex::new(None),
+                fan_helper,
+                fan_session: Mutex::new(None),
             });
+            app.state::<Monitor>()
+                .native_action(serde_json::json!({"action": "status"}))
+                .map_err(std::io::Error::other)?;
             let main = app.get_webview_window("main").unwrap();
             window_vibrancy::apply_vibrancy(
                 &main,
@@ -189,22 +368,36 @@ fn main() {
             get_snapshot,
             quick_action,
             open_application,
-            awake_status
+            native_action,
+            set_fan,
+            action_status
         ])
         .build(tauri::generate_context!())
         .expect("Unable to start z-monitor")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<Monitor>();
+                if let Err(e) = state.native_action(serde_json::json!({"action": "shutdown"})) {
+                    eprintln!("Native shutdown: {e}");
+                }
+                if let Ok(mut session) = state.fan_session.try_lock() {
+                    session.take();
+                }
                 let mut child = state.process.lock().unwrap();
                 if let Err(e) = child.kill().and_then(|_| child.wait().map(|_| ())) {
                     eprintln!("Telemetry shutdown: {e}");
                 }
-                if let Some(mut awake) = state.awake.lock().unwrap().take() {
-                    if let Err(e) = awake.kill().and_then(|_| awake.wait().map(|_| ())) {
-                        eprintln!("Caffeinate shutdown: {e}");
-                    }
-                };
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+    #[test]
+    fn failed_process_without_stderr_still_explains_failure() {
+        let error = run("/usr/bin/false", &[]).unwrap_err();
+        assert!(error.contains("/usr/bin/false"));
+        assert!(error.contains("exit status"));
+    }
 }

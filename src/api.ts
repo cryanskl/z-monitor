@@ -59,3 +59,22 @@ export async function openPanel(panel: string, detail = ""): Promise<void> {
     );
   });
 }
+
+export type ActionStatus = Record<string, boolean | number>;
+export async function nativeAction(
+  action: string,
+  options: Record<string, unknown> = {},
+): Promise<unknown> {
+  if (!desktop) throw new Error("请在 z-monitor 桌面应用中使用此功能");
+  return invoke("native_action", { request: { action, ...options } });
+}
+export async function actionStatus(): Promise<ActionStatus> {
+  return invoke("action_status");
+}
+export async function setFan(
+  id: number,
+  rpm: number | null,
+): Promise<{ id: number; target?: number; mode: string }> {
+  if (!desktop) throw new Error("请在桌面应用中调节风扇");
+  return invoke("set_fan", { id, rpm });
+}
