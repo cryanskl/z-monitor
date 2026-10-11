@@ -73,6 +73,14 @@ final class FanController {
       return ["id": id, "target": target, "mode": "manual"]
     }
     #if arch(arm64)
+      let currentMode = try required(mode)
+      if currentMode == 0 || currentMode == 3 {
+        controlled.remove(id)
+        try releaseForceIfUnused()
+        return ["id": id, "mode": "auto"]
+      }
+    #endif
+    #if arch(arm64)
       try retryWrite(mode, 0)
       try retryWrite("F\(id)Tg", 0)
     #else
