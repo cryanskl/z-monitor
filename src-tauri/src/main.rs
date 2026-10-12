@@ -116,6 +116,7 @@ impl Monitor {
         drop(listener);
         match accepted {
             Ok(stream) => {
+                stream.set_nonblocking(false).map_err(|e| e.to_string())?;
                 let mut uid = 0;
                 let mut gid = 0;
                 use std::os::fd::AsRawFd;

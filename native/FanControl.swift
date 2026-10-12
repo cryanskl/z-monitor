@@ -35,6 +35,19 @@ final class FanController {
     }
     throw last!
   }
+  func waitForValue(_ key: String, _ expected: Double, automatic: Bool = false) throws {
+    var observed = try required(key)
+    for _ in 0..<80 {
+      if abs(observed - expected) <= (key.hasSuffix("Tg") ? 1 : 0)
+        || (automatic && observed == 3)
+      {
+        return
+      }
+      usleep(100_000)
+      observed = try required(key)
+    }
+    throw MonitorError.system("SMC \(key) readback expected \(expected), got \(observed)", -1)
+  }
   func set(_ id: Int, _ rpm: Double?) throws -> [String: Any] {
     guard id >= 0, id < Int(try required("FNum")) else {
       throw MonitorError.system("Invalid fan", -1)
@@ -52,15 +65,18 @@ final class FanController {
         if keys.contains("Ftst") {
           if try required("Ftst") != 1 {
             try retryWrite("Ftst", 1)
+            try waitForValue("Ftst", 1)
             usleep(3_000_000)
           }
         }
         try retryWrite(mode, 1)
+        try waitForValue(mode, 1)
       #else
         let bits = Int(try required("FS! ")) | (1 << id)
         try retryWrite("FS! ", Double(bits))
       #endif
       try retryWrite("F\(id)Tg", rpm)
+      try waitForValue("F\(id)Tg", rpm)
       let target = try required("F\(id)Tg")
       guard abs(target - rpm) <= 1 else {
         throw MonitorError.system("Fan target readback failed", -1)
@@ -74,7 +90,7 @@ final class FanController {
     }
     #if arch(arm64)
       let currentMode = try required(mode)
-      if currentMode == 0 || currentMode == 3 {
+      if !controlled.contains(id) && (currentMode == 0 || currentMode == 3) {
         controlled.remove(id)
         try releaseForceIfUnused()
         return ["id": id, "mode": "auto"]
@@ -83,6 +99,7 @@ final class FanController {
     #if arch(arm64)
       try retryWrite(mode, 0)
       try retryWrite("F\(id)Tg", 0)
+      try waitForValue(mode, 0, automatic: true)
     #else
       try retryWrite("FS! ", Double(Int(try required("FS! ")) & ~(1 << id)))
     #endif
