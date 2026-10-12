@@ -62,11 +62,6 @@ export function Dashboard({
   const { status, statusError, refresh } = useActions();
   const [busy, setBusy] = useState<string | null>(null);
   useEffect(() => {
-    if (!notice) return;
-    const timer = setTimeout(() => setNotice(""), 6000);
-    return () => clearTimeout(timer);
-  }, [notice]);
-  useEffect(() => {
     if (!desktop) return;
     nativeAction("configure-hotkeys", { hotkeys: preferences.hotkeys }).catch(
       (e) => setNotice(String(e)),
@@ -79,6 +74,7 @@ export function Dashboard({
     openPanel("details", detail).catch((e) => setNotice(String(e)));
   };
   const run = async (id: string) => {
+    setNotice("");
     setBusy(id);
     try {
       const result = await action(id);
@@ -454,6 +450,11 @@ export function Dashboard({
       {(notice || statusError || (error && data)) && (
         <div className="toast" role="status">
           {notice || statusError || error}
+          {notice && (
+            <button className="link" onClick={() => setNotice("")}>
+              关闭提示
+            </button>
+          )}
         </div>
       )}
     </main>
