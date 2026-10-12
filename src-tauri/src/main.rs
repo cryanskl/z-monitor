@@ -247,7 +247,7 @@ async fn quick_action(
             if modes.is_empty() || !modes.iter().all(|value| *value == if on {"0"} else {"1"}) { return Err("省电模式设置未生效，请检查这台 Mac 是否支持低电量模式".into()); }
             Ok(if on {"off"} else {"on"}.into())
         },
-        "purge" => run("/usr/bin/osascript", &["-e", "do shell script \"/usr/bin/purge\" with administrator privileges"]),
+        "purge" => run("/usr/bin/osascript", &["-e", "do shell script \"/usr/sbin/purge\" with administrator privileges"]),
         "system-settings" => run("/usr/bin/open", &["-a", "System Settings"]),
         "disk-utility" => run("/usr/bin/open", &["-a", "Disk Utility"]),
         "system-information" => run("/usr/bin/open", &["-a", "System Information"]),
